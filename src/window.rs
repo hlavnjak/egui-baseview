@@ -100,6 +100,9 @@ where
     bg_color: Rgba,
     close_requested: bool,
     repaint_after: Option<Instant>,
+    /// Extra render owed after egui goes idle, to copy the final frame into the
+    /// double buffer's other half and avoid flicker. Set to 1 after each render.
+    sync_render_frames: u8,
 }
 
 impl<State, U> EguiWindow<State, U>
@@ -126,6 +129,13 @@ where
             panic!("gpu backend failed to initialize: \n {err}")
         });
         let egui_ctx = egui::Context::default();
+
+        // Wake the event loop on any repaint request (including cross-thread),
+        // so IdleWait::Block can sleep with no timer yet still service it.
+        {
+            let waker = window.waker();
+            egui_ctx.set_request_repaint_callback(move |_info| waker.wake());
+        }
 
         // Assume scale for now until there is an event with a new one.
         let pixels_per_point = match open_settings.scale_policy {
@@ -201,6 +211,7 @@ where
             bg_color,
             close_requested,
             repaint_after: Some(start_time),
+            sync_render_frames: 0,
         }
     }
 
@@ -294,6 +305,25 @@ where
             return;
         };
 
+        // Reactive frame gate: skip the whole pass unless something needs
+        // painting — pending input, a due timed repaint, egui still wanting to
+        // paint, or a buffer-sync render owed. Gating the whole frame keeps
+        // build and render atomic so we never present an empty frame.
+        let now = Instant::now();
+        let timer_due = self.repaint_after.map_or(false, |t| now >= t);
+        let have_input = !self.egui_input.events.is_empty();
+        let egui_wants = self.egui_ctx.has_requested_repaint();
+        // A pending buffer-sync render must run even if egui is now idle.
+        if !timer_due && !have_input && !egui_wants && self.sync_render_frames == 0 {
+            return;
+        }
+
+        // On a due timed repaint egui's own flag is already clear; re-arm it so
+        // a plugin gating its UI build on has_requested_repaint() still builds.
+        if timer_due {
+            self.egui_ctx.request_repaint();
+        }
+
         self.egui_input.time = Some(self.start_time.elapsed().as_secs_f64());
         self.egui_input.screen_rect = Some(calculate_screen_rect(
             self.physical_size,
@@ -339,11 +369,14 @@ where
         }
 
         let now = Instant::now();
-        let do_repaint_now = if let Some(t) = self.repaint_after {
+        let egui_repaint_now = if let Some(t) = self.repaint_after {
             now >= t || viewport_output.repaint_delay.is_zero()
         } else {
             viewport_output.repaint_delay.is_zero()
         };
+
+        // Render if egui wants to paint, or a buffer-sync render is still owed.
+        let do_repaint_now = egui_repaint_now || self.sync_render_frames > 0;
 
         if do_repaint_now {
             self.renderer.render(
@@ -357,6 +390,14 @@ where
             );
 
             self.repaint_after = None;
+
+            // A fresh egui frame arms one follow-up render to sync the other
+            // buffer; a follow-up render winds the counter back down to zero.
+            self.sync_render_frames = if egui_repaint_now {
+                1
+            } else {
+                self.sync_render_frames - 1
+            };
         } else if let Some(repaint_after) = now.checked_add(viewport_output.repaint_delay) {
             // Schedule to repaint after the requested time has elapsed.
             self.repaint_after = Some(repaint_after);
@@ -404,6 +445,20 @@ where
                     window.focus();
                 }
             }
+        }
+    }
+
+    fn idle_wait(&self) -> baseview::IdleWait {
+        // Tell the event loop how long it may sleep after this frame.
+        if self.sync_render_frames > 0 || self.egui_ctx.has_requested_repaint() {
+            // Buffer-sync owed or egui still painting: pace at the frame interval.
+            baseview::IdleWait::Paced
+        } else if let Some(t) = self.repaint_after {
+            // Timed repaint scheduled (tooltip, blink): sleep until then.
+            baseview::IdleWait::Until(t)
+        } else {
+            // Idle: sleep with no timer until an OS event or a Waker wake.
+            baseview::IdleWait::Block
         }
     }
 
@@ -597,6 +652,9 @@ where
                         .get_mut(&self.viewport_id)
                         .unwrap()
                         .focused = Some(false);
+                }
+                baseview::WindowEvent::Redraw => {
+                    self.repaint_after = Some(Instant::now());
                 }
                 baseview::WindowEvent::WillClose => {}
             },
