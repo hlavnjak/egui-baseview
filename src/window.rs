@@ -450,8 +450,12 @@ where
 
     fn idle_wait(&self) -> baseview::IdleWait {
         // Tell the event loop how long it may sleep after this frame.
-        if self.sync_render_frames > 0 || self.egui_ctx.has_requested_repaint() {
-            // Buffer-sync owed or egui still painting: pace at the frame interval.
+        if self.sync_render_frames > 0
+            || self.egui_ctx.has_requested_repaint()
+            || !self.egui_input.events.is_empty()
+        {
+            // Buffer-sync owed, egui still painting, or input not yet handed to egui
+            // (an event delivered after on_frame): pace at the frame interval.
             baseview::IdleWait::Paced
         } else if let Some(t) = self.repaint_after {
             // Timed repaint scheduled (tooltip, blink): sleep until then.
